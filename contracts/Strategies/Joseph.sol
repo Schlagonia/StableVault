@@ -9,17 +9,22 @@ pragma experimental ABIEncoderV2;
 import {BaseStrategy, StrategyParams} from "../BaseStrategy.sol";
 import {SafeERC20, SafeMath, IERC20, Address} from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 
+import "./SwapperJoe.sol";
 import "../interfaces/joe/Ijoe.sol";
 import "../interfaces/joe/Ijoetroller.sol";
 
-contract Strategy is BaseStrategy {
+//Add a deposit for function to pay down other strategies debt rather than unfold
+
+contract Joseph is BaseStrategy, SwapperJoe {
     using SafeERC20 for IERC20;
     using Address for address;
     using SafeMath for uint256;
 
-    Ijoetroller joetroller;
+    IJoetroller joetroller;
+    IERC20 joeToken = IERC20(0x6e84a6216eA6dACC71eE8E6b0a5B7322EEbC0fDd);
 
     struct TokenInfo {
+        bool added;
         bool live;
         string name;
         uint256 decimals;
@@ -30,19 +35,16 @@ contract Strategy is BaseStrategy {
     }
 
     uint256 tokens = 0;
-    // Used to add and remove twelve decimals to coins that only use 6 decimals
-    uint256 twelve = 1000000000000;
 
     mapping(uint256 => address) tokenId;
-    mapping(address => tokenInfo) tokenDetails;
+    mapping(address => TokenInfo) tokenDetails;
 
-    event tokenAded(string name, address tokenAddress, address lendingPool, bool isLive);
+    event tokenAdded(string name, address tokenAddress, address lendingPool, bool isLive);
 
-    constructor(address _vault, address _joetroller) public BaseStrategy(_vault) {
-        joetroller = Ijoetroller(_joetroller);
+    constructor(address _vault, address _joetroller, address _joeToken) public BaseStrategy(_vault) {
+        joetroller = IJoetroller(_joetroller);
+        joeToken = IERC20(_joeToken);
     }
-
-    // ******** OVERRIDE THESE METHODS FROM BASE CONTRACT ************
 
     function name() external view override returns (string memory) {
         // Add your own name here, suggestion e.g. "StrategyCreamYFI"
@@ -50,15 +52,32 @@ contract Strategy is BaseStrategy {
     }
 
     function setJoeTroller(address _joetroller) external onlyStrategist {
-        joetroller = Ijoetroller(_joetroller);
+        joetroller = IJoetroller(_joetroller);
+    }
+
+    function setJoeToken(address _token) external onlyStrategist  {
+        require(_token != address(0), "Must be valid address");
+        joeToken = IERC20(_token); 
+    }
+
+    function setMightyJoeRouter(address _router) external onlyStrategist {
+        require(_router != address(0), "Must be valid address");
+        _setMightyJoeRouter(_router);
+    }
+
+    function setJoeFactory(address _factory) external onlyStrategist {
+        require(_factory != address(0), "Must be valid address");
+        _setJoeFactory(_factory);
     }
 
     function addToken(
-        string _name,
+        string memory _name,
+        address _token,
         bool _live,
-        address _pool
+        address _pool,
+        uint256 _decimals
     ) external onlyStrategist {
-        require(!tokenDetails[_token], "Token already added");
+        require(!tokenDetails[_token].added , "Token already added");
 
         uint256 newId = tokens;
         tokens++;
@@ -69,12 +88,13 @@ contract Strategy is BaseStrategy {
 
         //Need to find the debt threshhold for the token in the lending pool
         (bool isListed, uint256 collateralFactorMantissa) = joetroller.markets(_pool);
-        require(islisted, "No Lending pool available");
+        require(isListed, "No Lending pool available");
 
         tokenDetails[_token] = TokenInfo({
+            added: true,
             live: _live, // Is the token allowed to be used
             name: _name, // Name of the token
-            decimals: IERC20(_token).decimals(), // How many decimals it uses
+            decimals: _decimals, // How many decimals it uses
             pool: _pool, // Address of the lending pool
             totalDeposited: 0, //total number of shares for the token
             totalBorrowed: 0, //total number of tokens deposited
@@ -83,7 +103,13 @@ contract Strategy is BaseStrategy {
 
         _enterMarket(_pool);
 
-        emit TokenAdded(_name, _token, _pool, _live);
+        emit tokenAdded(_name, _token, _pool, _live);
+    }
+
+    function changeLive(address _token) external onlyStrategist {
+        require(tokenDetails[_token].added, "Token not used");
+
+        tokenDetails[_token].added = !tokenDetails[_token].added;
     }
 
     function _enterMarket(address _pool) internal {
@@ -107,14 +133,15 @@ contract Strategy is BaseStrategy {
         );
         
         // get deposited balanace
-        uint256 got = jTokenBalance.mul(exchangeRateMantissa);
+        uint256 got;
         //correct decimals if need to
         if(_decimals == 6) {
-            got = got.div(1e6);
+            got = jTokenBalance.mul(exchangeRateMantissa).div(1e6);
             //subtract borrowed balance
             got = got.sub(borrowBalance.mul(1e12));
-        } else {
-        
+        } else if (_decimals == 18) {
+            
+            got = jTokenBalance.mul(exchangeRateMantissa).div(1e18);
             got = got.sub(borrowBalance);
         }
         return got;
@@ -125,16 +152,16 @@ contract Strategy is BaseStrategy {
         uint256 bal;
 
         for (uint256 i = 0; i < tokens; i++) {
-            TokenInfo tokenInfo = tokenDetails[tokenId[i]];
+            TokenInfo storage tokenInfo = tokenDetails[tokenId[i]];
 
             bal = balanceOfWant(tokenId[i]);
 
             if (tokenInfo.decimals == 6) {
                 //correct the number to be 18 decimals
-                bal = bal.mul(twelve);
+                bal = bal.mul(1e12);
             }
 
-            //assuming balance of vault returns 1e18 put it here
+            //add balance of vault returned in underlying
             bal = bal.add(balanceOfVault(tokenInfo.pool, tokenInfo.decimals));
 
             total = total.add(bal);
