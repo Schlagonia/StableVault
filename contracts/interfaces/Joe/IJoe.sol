@@ -12,6 +12,14 @@ interface IJoe {
 
     function repayBorrow(uint256 repayAmount) external returns (uint256);
 
+    function transfer(address dst, uint256 amount) external returns (bool);
+
+    function transferFrom(
+        address src,
+        address dst,
+        uint256 amount
+    ) external returns (bool);
+
         /**
      * @notice Get the token balance of the `owner`
      * @param owner The address of the account to query

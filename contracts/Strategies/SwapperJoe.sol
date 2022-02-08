@@ -28,6 +28,17 @@ contract SwapperJoe {
         joeFactory = IJoeFactory(_factory); 
     }
 
+    function _checkPrice(uint256 _amount, address _from, address _to) internal view returns (uint256) {
+        require(joeFactory.getPair(_from, _to) != address(0), "No Trading Pair for tokens");
+        if(_amount == 0 ) {
+            return 0;
+        }
+
+        (uint256 fromReserve, uint256 toReserve) = JoeLibrary.getReserves(address(joeFactory), _from, _to);
+
+        return JoeLibrary.getAmountOut(_amount, fromReserve, toReserve);
+
+    }
     function _swapFrom(uint256 _amount, address _from, address _to) internal {
 
         require(joeFactory.getPair(_from, _to) != address(0), "No Trading Pair for tokens");
