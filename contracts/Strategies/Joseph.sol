@@ -10,14 +10,14 @@ import {BaseStrategy, StrategyParams} from "../BaseStrategy.sol";
 import {SafeERC20, SafeMath, IERC20, Address} from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import {Math} from "@openzeppelin/contracts/math/Math.sol";
 
-import "./SwapperJoe.sol";
+import "./SwapperLife.sol";
 import "../interfaces/joe/Ijoe.sol";
 import "../interfaces/joe/Ijoetroller.sol";
 import "../interfaces/joe/IJoeRewarder.sol";
 
 //Add a deposit for function to pay down other strategies debt rather than unfold
 
-contract Joseph is BaseStrategy, SwapperJoe {
+contract Joseph is BaseStrategy, SwapperLife {
     using SafeERC20 for IERC20;
     using Address for address;
     using SafeMath for uint256;
@@ -25,8 +25,15 @@ contract Joseph is BaseStrategy, SwapperJoe {
     IJoetroller joetroller;
     IJoeRewarder joeRewarder = IJoeRewarder(0x45B2C4139d96F44667577C0D7F7a7D170B420324);
     IERC20 joeToken = IERC20(0x6e84a6216eA6dACC71eE8E6b0a5B7322EEbC0fDd);
+    
 
-    uint256 public iterations; //number of loops we do
+    uint256 public loops = 3; //number of loops we do
+    uint256 collateralTarget =  750000000000000000;
+    uint256 minimumBorrow = 1000000000000000000;  //1e18
+    uint256 minInvest = 1000000000000000000;  //1e18
+    uint256 constant secondsPerYear = 31536000;
+    uint256 SuppliedIndex;
+    uint256 BorrowedIndex;
 
     struct TokenInfo {
         bool added;
@@ -59,6 +66,22 @@ contract Joseph is BaseStrategy, SwapperJoe {
         return "Joseph Money Market";
     }
 
+    function setLoops(uint256 _loops) external onlyStrategist {
+        loops = _loops;
+    }
+
+    function setCollateralTartet(uint256 _target) external onlyStrategist {
+        collateralTarget = _target;
+    }
+
+    function setMinimumBorrow(uint256 _min) external onlyStrategist {
+        minimumBorrow = _min;
+    }
+
+    function setMinInvest(uint256 _min) external onlyStrategist {
+        minInvest = _min;
+    }
+
     function setJoeTroller(address _joetroller) external onlyStrategist {
         require(_joetroller != address(0), "Must be valid address");
         joetroller = IJoetroller(_joetroller);
@@ -82,6 +105,11 @@ contract Joseph is BaseStrategy, SwapperJoe {
     function setJoeRewarder(address _rewarder) external onlyStrategist {
         require(_rewarder != address(0), "Must be valid Address");
         joeRewarder = IJoeRewarder(_rewarder);
+    }
+
+    function setPTPPool(address _pool) external onlyStrategist {
+        require(_pool != address(0), "Must be valid Address");
+        ptpPool = IPTPPool(_pool);
     }
 
     //Add new tokens
@@ -120,7 +148,20 @@ contract Joseph is BaseStrategy, SwapperJoe {
 
         _enterMarket(_pool);
 
+        //approve Pool
+        IERC20(_token).approve(_pool, type(uint256).max);
+
         emit tokenAdded(_name, _token, _pool, _live);
+    }
+
+    function updateToken(
+        string memory _name,
+        address _token,
+        bool _live,
+        address _pool,
+        uint256 _decimals
+    ) external onlyStrategist {
+
     }
 
     function changeLive(address _token) external onlyStrategist {
@@ -155,6 +196,7 @@ contract Joseph is BaseStrategy, SwapperJoe {
         if (_decimals == 6) {
             got = jTokenBalance.mul(exchangeRateMantissa).div(1e6);
             //subtract borrowed balance
+            //@dev need to account for negative balances with no positve balance
             got = got.sub(borrowBalance.mul(1e12));
         } else if (_decimals == 18) {
             got = jTokenBalance.mul(exchangeRateMantissa).div(1e18);
@@ -163,45 +205,11 @@ contract Joseph is BaseStrategy, SwapperJoe {
         return got;
     }
 
-    function addList(uint256[] memory _list) internal view returns (uint256 _total) {
-        _total = 0;
-
-        for (uint256 i = 0; i < _list.length; i++) {
-            uint256 dec = tokenDetails[tokenId[i]].decimals;
-
-            if (dec == 18) {
-                _total = _total.add(_list[i]);
-            } else if (dec == 6) {
-                _total = _total.add(_list[i].mul(1e12));
-            }
-        }
-
-        return _total;
-    }
-
-    //returns a list with the free balance of each token in their native decimals
-    function getFreeVaules() internal view returns (uint256[] memory _freeVaules) {
-        _freeVaules = new uint256[](tokens);
-
-        for (uint256 i = 0; i < tokens; i++) {
-            //need to adjust for decimal
-            uint256 bal = balanceOfWant((tokenId[i]));
-            if (tokenDetails[tokenId[i]].decimals == 6) {
-                //correct the number to be 18 decimals
-                bal = bal.mul(1e12);
-            }
-
-            _freeVaules[i] = bal;
-        }
-
-        return _freeVaules;
-    }
-
     //returns net balance of all all free and invested token to 18 decimals
     function getStableCoinBalance() internal view returns (uint256 _total) {
         _total = 0;
 
-
+        //need to account for negative balances due to dust left in boorow bools
         for (uint256 i = 0; i < tokens; i++) {
             TokenInfo storage tokenInfo = tokenDetails[tokenId[i]];
             uint256 bal = balanceOfWant(tokenId[i]);
@@ -227,26 +235,29 @@ contract Joseph is BaseStrategy, SwapperJoe {
         uint256 current = balanceOfWant(address(joeToken));
 
         // Use touch price. it doesnt matter if we are wrong as this is not used for decision making
-        uint256 estimatedWant = _checkPrice(_claimable.add(current), address(joeToken), tokenId[0]);
+        uint256 estimatedWant = _checkPrice(address(joeToken), tokenId[0], _claimable.add(current));
         total = estimatedWant.mul(9).div(10); //10% pessimist
 
-        for (uint256 i = 0; i < tokens; i++) {
-            TokenInfo storage tokenInfo = tokenDetails[tokenId[i]];
+        uint256 jTokens = getStableCoinBalance();
 
-            bal = balanceOfWant(tokenId[i]);
-
-            if (tokenInfo.decimals == 6) {
-                //correct the number to be 18 decimals
-                bal = bal.mul(1e12);
-            }
-
-            //add balance of vault returned in underlying
-            bal = bal.add(balanceOfVault(tokenInfo.pool, tokenInfo.decimals));
-
-            total = total.add(bal);
-        }
+        total = total.add(jTokens);
 
         return total;
+    }
+
+    function swapStable(
+        address _from,
+        address _to,
+        uint256 _amount
+    ) internal returns (uint256 actualOut) {
+        uint256 ptpOut = _ptpQoute(_from, _to, _amount);
+        uint256 joeOut = _checkPrice(_from, _to, _amount);
+
+        if(ptpOut >= joeOut) {
+            actualOut = _ptpSwapWithAmount(_from, _to, _amount, ptpOut);
+        } else {
+            actualOut = _swapFromWithAmount(_from, _to, _amount, joeOut);
+        }
     }
 
     function checkreward() public view returns (bool) {
@@ -259,7 +270,7 @@ contract Joseph is BaseStrategy, SwapperJoe {
     }
 
     function harvesterJoe() internal {
-        if(checkreward()){
+        if (checkreward()) {
             joetroller.claimReward(0, payable(address(this)));
         }
     }
@@ -268,14 +279,76 @@ contract Joseph is BaseStrategy, SwapperJoe {
         //Calculates an expected amount of claimable reward tokens
     }
 
-    function checkAPRs() internal view returns (address _supplyToken, address _borrowToken) {
-        //check supply and borrow apy for every token
-        // both the rate and reward
-        //add supplyRate and reward
-        // subtract borrowRate and reward to get net APYs
-        //deposit token = highest net supply rate
-        //borrow token = lowest net borrow rate
+    //call to find the pool that is paying the highest supply apy and the lowest borrow apy
+    //Takes in to account both native rates and reward distribution
+    //Returns _supplyIndex of highest and _borrowIndex of lowest
+    function checkAPRs() internal view returns (uint256, uint256) {
+        
+        uint256 _supplyIndex;
+        uint256 _borrowIndex;
+        uint256 supplyApr = 0;
+        uint256 borrowApr = type(uint256).max;
+
+        //get joe price with a price check
+        uint256 joePrice = _checkPrice(address(joeToken), tokenId[0], 1e18);
+        
+        for (uint256 i = 0; i < tokens; i++) {
+            TokenInfo storage tokenInfo = tokenDetails[tokenId[i]];
+            IJoe _pool = IJoe(tokenInfo.pool);
+            uint256 supplyRewardFinal = 0;
+            uint256 borrowRewardFinal = 0;
+
+            uint256 rewardSupplyRate = joeRewarder.rewardSupplySpeeds(0, address(_pool));
+            uint256 rewardBorrowRate = joeRewarder.rewardBorrowSpeeds(0, address(_pool));
+            //get balances of borrow adn cash-reserves
+            //get the dollar value of joe supply rate per second
+            // rewardAPY = (joePrice * rewardRate) / totalAssets
+            if(rewardSupplyRate > 0){
+                uint256 totalAssets = _pool.getCash().add(_pool.totalBorrows()).sub(_pool.totalReserves());
+                
+                //adjust decimals since quote is in 6 decimals
+                if(tokenInfo.decimals == 18) {
+                    rewardSupplyRate = rewardSupplyRate.mul(1e12);
+                }
+
+                supplyRewardFinal = joePrice.mul(rewardSupplyRate).div(totalAssets);
+            }
+
+            if(rewardBorrowRate > 0){
+                uint256 borrowedAssets = _pool.totalBorrows();
+                //adjust decimals since quote is in 6 decimals
+                if(tokenInfo.decimals == 18) {
+                    rewardBorrowRate = rewardBorrowRate.mul(1e12);
+                }
+
+                borrowRewardFinal = joePrice.mul(rewardBorrowRate).div(borrowedAssets);
+            }
+
+            uint256 nativeSupplyRate = _pool.supplyRatePerSecond();
+            uint256 nativeBorrowRate = _pool.borrowRatePerSecond();
+
+            uint256 netSupply = nativeSupplyRate.add(supplyRewardFinal);
+            uint256 netBorrow = 0;
+            //check for overflow
+            if(nativeBorrowRate > borrowRewardFinal){
+                netBorrow = nativeBorrowRate.sub(borrowRewardFinal);
+            } 
+           
+            if(netSupply > supplyApr) {
+                supplyApr = netSupply;
+                _supplyIndex = i;
+            }
+
+            if(netBorrow < borrowApr) {
+                borrowApr = netBorrow;
+                _borrowIndex = i;
+            }
+          
+        }
+
+        return(_supplyIndex, _borrowIndex);
     }
+    
 
     function prepareReturn(uint256 _debtOutstanding)
         internal
@@ -297,7 +370,7 @@ contract Joseph is BaseStrategy, SwapperJoe {
         harvesterJoe();
         //swap rewards to main want
         //create a minimumJoe to need to meet in order to swap
-        _swapFrom(joeToken.balanceOf(address(this)), address(joeToken), tokenId[0]);
+        _swapFrom(address(joeToken), tokenId[0], joeToken.balanceOf(address(this)));
 
         //get base want balance
         uint256 wantBalance = balanceOfWant(tokenId[0]);
@@ -349,19 +422,149 @@ contract Joseph is BaseStrategy, SwapperJoe {
         }
     }
 
+    function checkLiquidity() internal view returns (uint256, uint256) {
+        //Get my account's total liquidity value in Compound
+        (uint256 error2, uint256 liquidity, uint256 shortfall) = joetroller.getAccountLiquidity(address(this));
+        if (error2 != 0) {
+            revert("Comptroller.getAccountLiquidity failed.");
+        }
+ 
+        return (liquidity, shortfall);
+    }
+
     function adjustPosition(uint256 _debtOutstanding) internal override {
         // TODO: Do something to invest excess `want` tokens (from the Vault) into your positions
         // NOTE: Try to adjust positions so that `_debtOutstanding` can be freed up on *next* harvest (not immediately)
+        //emergency exit is dealt with in prepareReturn
+        if (emergencyExit) {
+            return;
+        }
+
+        //we are spending all our cash unless we have debt outstanding
+        uint256 _wantBal = balanceOfWant(tokenId[0]);
+        if (_wantBal < _debtOutstanding) {
+            //this is graceful withdrawal. dont use backup
+            //we use more than 1 because withdrawunderlying causes problems with 1 token due to different decimals
+            //check the current supplied Index
+            if (balanceOfWant(tokenDetails[tokenId[SuppliedIndex]].pool) > 1) {
+                withdrawSome(_debtOutstanding.sub(_wantBal));
+            }
+
+            return;
+        }
+
+        //We have something to invest
+        uint256 toInvest = _wantBal.sub(_debtOutstanding);
+        if(toInvest < minInvest){
+            //not enough
+            return;
+        }
+      
+        //invest balance of supply
+        depositSome(toInvest);
     }
 
-    function withdrawSome(uint256 _amount) internal returns (uint256) {
+    //return amount to borrow with 18 decimals
+    function toBorrow() internal returns (uint256) {
+
+        
+TokenInfo storage supplyTokenInfo = tokenDetails[tokenId[SuppliedIndex]];
+        TokenInfo storage borrowTokenInfo = tokenDetails[tokenId[BorrowedIndex]];
+        IJoe supplyPool =  IJoe(supplyTokenInfo.pool);
+        IJoe borrowPool =  IJoe(borrowTokenInfo.pool);
+        
+        (uint256 error, uint256 jTokenBalance, uint256 borrowBalance, uint256 exchangeRateMantissa) = supplyPool.getAccountSnapshot(
+            address(this)
+        );
+        uint256 borrowedBalance = borrowPool.borrowBalanceStored(address(this));
+
+        if(borrowTokenInfo.decimals == 6) {
+            borrowedBalance = borrowedBalance.mul(1e12);
+        }
+
+        uint256 supply = jTokenBalance.mul(exchangeRateMantissa).div(1e18);
+        
+        uint256 desiredBorrow = supply.mul(collateralTarget).div(1e18);
+
+        if(desiredBorrow < borrowedBalance) {
+            //overlevereged dont borrow any more
+            //should not happen
+            withdrawSome(borrowedBalance.sub(desiredBorrow));
+            return 0;
+        }
+
+        uint256 _toBorrow = desiredBorrow.sub(borrowedBalance);
+    }
+
+    //_amount in want decimals
+    function leverage(uint256 _amount) internal {
+        TokenInfo storage supplyTokenInfo = tokenDetails[tokenId[SuppliedIndex]];
+        TokenInfo storage borrowTokenInfo = tokenDetails[tokenId[BorrowedIndex]];
+        IJoe supplyPool =  IJoe(supplyTokenInfo.pool);
+        IJoe borrowPool =  IJoe(borrowTokenInfo.pool);
+
+        if(SuppliedIndex != 0) {
+            swapStable(tokenId[0], tokenId[SuppliedIndex], _amount);
+        } 
+      
+        supplyPool.mint(balanceOfWant(tokenId[SuppliedIndex]));
+
+        uint256 _toBorrow = toBorrow();
+
+        uint i = 0;
+        while(_toBorrow > minimumBorrow && i < loops ) {
+
+            if(borrowTokenInfo.decimals == 6) {
+                _toBorrow = _toBorrow.div(1e12);
+            }
+        
+            borrowPool.borrow(_toBorrow);
+            swapStable(tokenId[BorrowedIndex], tokenId[SuppliedIndex], balanceOfWant(tokenId[BorrowedIndex]));
+
+            _toBorrow = toBorrow();
+            i++;
+        }
+
+    }
+      
+    //amount is in want decimals
+    function depositSome(uint256 _amount) internal {
+        bool changeSupplied = false;
+        bool changeBorrowed = false;
+
+        (uint256 _supplyIndex, uint256 _borrowIndex)  = checkAPRs();
+        //check if thats where we are
+        if(_supplyIndex != SuppliedIndex) {
+            changeSupplied = true;
+        }
+        if(_borrowIndex != BorrowedIndex) {
+            changeBorrowed = true;
+        }
+
+        if(!changeSupplied && !changeBorrowed) {
+            leverage(_amount);
+        }
+
+    }
+
+    function withdrawSome(uint256 _amount) internal {
         //perform logic to unwind position
+        
+
+
     }
 
     function liquidatePosition(uint256 _amountNeeded) internal override returns (uint256 _liquidatedAmount, uint256 _loss) {
         // TODO: Do stuff here to free up to `_amountNeeded` from all positions back into `want`
         // NOTE: Maintain invariant `want.balanceOf(this) >= _liquidatedAmount`
         // NOTE: Maintain invariant `_liquidatedAmount + _loss <= _amountNeeded`
+
+        uint256 wantBalance = balanceOfWant(tokenId[0]);
+        if(wantBalance > _amountNeeded) {
+            return (0, 0);
+        }
+
+        uint256 diff = _amountNeeded.sub(wantBalance);
 
         uint256 totalAssets = want.balanceOf(address(this));
         if (_amountNeeded > totalAssets) {
@@ -377,19 +580,17 @@ contract Joseph is BaseStrategy, SwapperJoe {
         return want.balanceOf(address(this));
     }
 
-
     //should be able to send tokens without getting liquidated
     function prepareMigration(address _newStrategy) internal override {
-        
         harvesterJoe();
-        _swapFrom(joeToken.balanceOf(address(this)), address(joeToken), address(want));
+        _swapFrom(address(joeToken), address(want), joeToken.balanceOf(address(this)));
 
         IJoe JToken = IJoe(tokenDetails[tokenId[0]].pool);
         JToken.transfer(_newStrategy, JToken.balanceOf(address(this)));
 
         //start at 1 so you dont send the want token
-        for(uint256 i = 1; i < tokens; i++) { 
-            IERC20 token = IERC20(tokenId[i]);  
+        for (uint256 i = 1; i < tokens; i++) {
+            IERC20 token = IERC20(tokenId[i]);
             JToken = IJoe(tokenDetails[tokenId[i]].pool);
             token.transfer(_newStrategy, token.balanceOf(address(this)));
             JToken.transfer(_newStrategy, JToken.balanceOf(address(this)));
@@ -413,10 +614,10 @@ contract Joseph is BaseStrategy, SwapperJoe {
 
         //replace the first item which is want with the reward token
         protected[0] = address(joeToken);
-        
+
         return protected;
     }
-        
+
     /**
      * @notice
      *  Provide an accurate conversion from `_amtInWei` (denominated in wei)

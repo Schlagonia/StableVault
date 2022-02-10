@@ -14,6 +14,21 @@ interface IJoe {
 
     function transfer(address dst, uint256 amount) external returns (bool);
 
+    //returns 18 digit borrow rate per block
+    function borrowRatePerSecond() external view returns (uint);
+
+    function supplyRatePerSecond() external view returns (uint);
+
+       /**
+     * @notice Get cash balance of this jToken in the underlying asset
+     * @return The quantity of underlying asset owned by this contract
+     */
+    function getCash() external view returns (uint256);
+    
+    function totalReserves() external view returns(uint256);
+
+    function totalBorrows() external view returns(uint256);
+    
     function transferFrom(
         address src,
         address dst,
